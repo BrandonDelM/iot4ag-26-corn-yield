@@ -202,7 +202,7 @@ for files in image_path_location[0]:
 for locationfolder in finalimagefolder:
 
     timepointfolder=os.listdir(locationfolder)
-    timepointfolder=sorted(timepointfolder)
+    timepointfolder=sorted([x for x in timepointfolder if not x.startswith('.')])
     imagetype=locationfolder.split('/')[1]
     print(imagetype)
 
