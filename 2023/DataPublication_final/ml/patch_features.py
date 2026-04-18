@@ -290,7 +290,8 @@ def run_random_forest(features_df, groundtruth_df,
     ]
 
     merged = features_df.merge(
-        groundtruth_df[['location', 'range', 'row', 'experiment', 'yieldPerAcre']
+        groundtruth_df[['location', 'range', 'row', 'experiment', 'yieldPerAcre',
+                        'genotype', 'nitrogenTreatment']   # raw strings for metadata
                        + AGRONOMIC_FEATURES],
         on=['location', 'range', 'row', 'experiment'],
         how='inner'
@@ -378,9 +379,17 @@ def run_random_forest(features_df, groundtruth_df,
     # Clean up helper columns
     merged = merged.drop(columns=['_plot_key'], errors='ignore')
 
+    # ── Keep metadata columns for the scoring engine output ──
+    METADATA_COLS = ['location', 'range', 'row', 'experiment',
+                     'genotype', 'nitrogenTreatment', 'timepoint']
+    # Only keep columns that actually exist in merged
+    meta_cols_present = [c for c in METADATA_COLS if c in merged.columns]
+    metadata = merged[meta_cols_present].reset_index(drop=True)
+
     # ── Prepare X and y ──
     drop_cols = [c for c in merged.columns if 'Imagename' in c] + \
-                ['location', 'timepoint', 'experiment', 'range', 'row']
+                ['location', 'timepoint', 'experiment', 'range', 'row',
+                 'genotype', 'nitrogenTreatment']   # metadata only — not features
     feature_cols = [c for c in merged.columns
                     if c not in drop_cols + ['yieldPerAcre']]
 
@@ -407,15 +416,14 @@ def run_random_forest(features_df, groundtruth_df,
     print(f"    → {n_agro} agronomic features")
 
     # ── Stratified 70 / 15 / 15 split by yield range ──
-    # Bins yield into 4 equal groups so low/high yield plots are
-    # proportionally represented in all three sets
-    y_bins = pd.qcut(y, q=4, labels=False)
+    indices = np.arange(len(X))
+    y_bins  = pd.qcut(y, q=4, labels=False)
 
-    X_train, X_temp, y_train, y_temp, bins_train, bins_temp = train_test_split(
-        X, y, y_bins, test_size=0.30, random_state=42, stratify=y_bins
+    X_train, X_temp, y_train, y_temp, idx_train, idx_temp, bins_train, bins_temp = train_test_split(
+        X, y, indices, y_bins, test_size=0.30, random_state=42, stratify=y_bins
     )
-    X_val, X_test, y_val, y_test, _, _ = train_test_split(
-        X_temp, y_temp, bins_temp, test_size=0.50, random_state=42, stratify=bins_temp
+    X_val, X_test, y_val, y_test, idx_val, idx_test, _, _ = train_test_split(
+        X_temp, y_temp, idx_temp, bins_temp, test_size=0.50, random_state=42, stratify=bins_temp
     )
 
     print(f"\nData split (stratified by yield range):")
@@ -438,9 +446,7 @@ def run_random_forest(features_df, groundtruth_df,
         min_child_weight=min_samples_leaf,
         random_state=42,
         n_jobs=n_jobs,
-        verbosity=0,
-        reg_alpha=0.1,
-        reg_lambda=2.0
+        verbosity=0
     )
     model.fit(X_train, y_train)
     print(f"  Done.")
@@ -534,15 +540,27 @@ def run_random_forest(features_df, groundtruth_df,
     plt.show()
     print("Saved feature_importances.png")
 
-    # ── Save test predictions ──
-    pd.DataFrame({
-        'actual':         y_test,
-        'predicted':      y_pred_test,
-        'error':          y_pred_test - y_test,
-        'absolute_error': np.abs(y_pred_test - y_test),
-        'pct_error':      np.abs((y_test - y_pred_test) / y_test) * 100
-    }).to_csv('./xgb_predictions.csv', index=False)
-    print("Saved xgb_predictions.csv")
+    # ── Save predictions with metadata (all splits) ──
+    # Run predictions on all data so the scoring engine has every plot
+    y_pred_all = model.predict(X)
+
+    all_predictions = metadata.copy()
+    all_predictions['actual_yield']    = y
+    all_predictions['predicted_yield'] = y_pred_all
+    all_predictions['error']           = y_pred_all - y
+    all_predictions['absolute_error']  = np.abs(y_pred_all - y)
+    all_predictions['pct_error']       = np.abs((y - y_pred_all) / y) * 100
+    all_predictions['split'] = 'train'
+    all_predictions.loc[idx_val,  'split'] = 'val'
+    all_predictions.loc[idx_test, 'split'] = 'test'
+
+    all_predictions.to_csv('xgb_predictions_full.csv', index=False)
+    print("Saved xgb_predictions_full.csv  (all plots + metadata — use this for scoring engine)")
+
+    # Also save test-only for quick reference
+    test_predictions = all_predictions[all_predictions['split'] == 'test'].copy()
+    test_predictions.to_csv('xgb_predictions.csv', index=False)
+    print("Saved xgb_predictions.csv  (test split only)")
 
     return model
 
@@ -596,6 +614,6 @@ if __name__ == '__main__':
     print("\nRunning Random Forest with patch features...")
     model = run_random_forest(features_df, groundtruth,
                               n_estimators=300,
-                              max_depth=6,
-                              min_samples_leaf=20, 
-                              max_features=0.2)
+                              max_depth=10,          # tightened from 15
+                              min_samples_leaf=15,   # tightened from 10
+                              max_features=0.2)      # tightened from 0.3
