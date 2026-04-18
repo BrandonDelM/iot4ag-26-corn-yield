@@ -425,21 +425,23 @@ def run_random_forest(features_df, groundtruth_df,
     print(f"  Yield range in test  : {y_test.min():.1f} – {y_test.max():.1f} bu/acre")
     print(f"  Yield range in train : {y_train.min():.1f} – {y_train.max():.1f} bu/acre")
 
-    # ── Train Random Forest with tighter regularization ──
-    print(f"\nTraining Random Forest ({n_estimators} trees)...")
+    # ── Train XGBoost ──
+    print(f"\nTraining XGBoost ({n_estimators} trees)...")
     print(f"  max_depth={max_depth}, min_samples_leaf={min_samples_leaf}, max_features={max_features}")
-    model = RandomForestRegressor(
+    from xgboost import XGBRegressor
+    model = XGBRegressor(
         n_estimators=n_estimators,
         max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        max_features=max_features,
-        max_samples=0.8,
-        n_jobs=n_jobs,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=max_features,
+        min_child_weight=min_samples_leaf,
         random_state=42,
-        oob_score=True
+        n_jobs=n_jobs,
+        verbosity=0
     )
     model.fit(X_train, y_train)
-    print(f"  Done. Out-of-bag R² (train): {model.oob_score_:.3f}")
+    print(f"  Done.")
 
     # ── 5-fold cross-validation on train set to check stability ──
     from sklearn.model_selection import cross_val_score
@@ -489,7 +491,7 @@ def run_random_forest(features_df, groundtruth_df,
         'importance': model.feature_importances_
     }).sort_values('importance', ascending=False).head(20)
 
-    print("\n  === Top 20 Most Important Patch Features ===")
+    print("\n  === Top 20 Most Important Features ===")
     print(importance_df.to_string(index=False))
 
     # ── Save model ──
@@ -514,7 +516,7 @@ def run_random_forest(features_df, groundtruth_df,
         ax.set_ylabel('Predicted Yield (bu/acre)')
         ax.set_title(f'{label}\nR²={r2:.3f}  MAE={mae:.1f} bu/acre')
         ax.legend(fontsize=8)
-    plt.suptitle(f'Random Forest — Patch grid {GRID_SIZE}×{GRID_SIZE} — Predicted vs Actual', fontsize=13)
+    plt.suptitle(f'XGBoost — Patch grid {GRID_SIZE}×{GRID_SIZE} — Predicted vs Actual', fontsize=13)
     plt.tight_layout()
     plt.savefig('predicted_vs_actual.png', dpi=150)
     plt.show()
@@ -524,7 +526,7 @@ def run_random_forest(features_df, groundtruth_df,
     fig, ax = plt.subplots(figsize=(9, 7))
     ax.barh(importance_df['feature'][::-1], importance_df['importance'][::-1], color='steelblue')
     ax.set_xlabel('Importance')
-    ax.set_title(f'Top 20 Patch Feature Importances (Random Forest)')
+    ax.set_title(f'Top 20 Feature Importances (XGBoost)')
     plt.tight_layout()
     plt.savefig('feature_importances.png', dpi=150)
     plt.show()
@@ -537,8 +539,8 @@ def run_random_forest(features_df, groundtruth_df,
         'error':          y_pred_test - y_test,
         'absolute_error': np.abs(y_pred_test - y_test),
         'pct_error':      np.abs((y_test - y_pred_test) / y_test) * 100
-    }).to_csv('rf_predictions.csv', index=False)
-    print("Saved rf_predictions.csv")
+    }).to_csv('xgb_predictions.csv', index=False)
+    print("Saved xgb_predictions.csv")
 
     return model
 
@@ -547,7 +549,7 @@ def run_random_forest(features_df, groundtruth_df,
 # MAIN
 # ─────────────────────────────────────────────
 
-GRID_SIZE = 2   # change to 3, 5, 6, 8 etc to try different patch granularities
+GRID_SIZE = 4   # change to 3, 5, 6, 8 etc to try different patch granularities
 
 if __name__ == '__main__':
 
