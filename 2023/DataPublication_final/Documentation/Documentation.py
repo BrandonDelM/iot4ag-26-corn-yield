@@ -108,7 +108,8 @@ def satelliteimage(inputpath):
     band_values=band_values.groupby('Imagename')[list(band_values.describe().columns)].agg(['mean', 'median', 'sum']).reset_index()
     band_values.columns = band_values.columns.map('_'.join)
 
-    return band_values.loc[0]
+    # return band_values.loc[0]
+    return band_values.loc
 
 
 
@@ -156,7 +157,8 @@ def RGB(inputpath):
     RGB_values=RGB_values[RGB_values['Red']>0] ##Remove the pixel values that is equal to zero
     RGB_values=RGB_values.groupby('Imagename')[list(RGB_values.describe().columns)].agg(['mean', 'median', 'sum']).reset_index()
     RGB_values.columns = RGB_values.columns.map('_'.join)
-    return RGB_values.loc[0]
+    # return RGB_values.loc[0]
+    return RGB_values.loc
 
 
 # In[25]:
@@ -241,8 +243,8 @@ satfile=random.choice(Final_path[0:6])
 basefile=os.path.basename(satfile)
 
 if basefile.endswith('.TIF'):
-    Value=satelliteimage(satfile).to_string()
-    print(Value)
+    bands=satelliteimage(satfile)
+    rgb=RGB(satfile)
 
 
 # In[ ]:
