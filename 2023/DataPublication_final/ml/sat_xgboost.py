@@ -438,7 +438,9 @@ def run_random_forest(features_df, groundtruth_df,
         min_child_weight=min_samples_leaf,
         random_state=42,
         n_jobs=n_jobs,
-        verbosity=0
+        verbosity=0,
+        reg_alpha=0.1,
+        reg_lambda=2.0
     )
     model.fit(X_train, y_train)
     print(f"  Done.")
@@ -594,6 +596,6 @@ if __name__ == '__main__':
     print("\nRunning Random Forest with patch features...")
     model = run_random_forest(features_df, groundtruth,
                               n_estimators=300,
-                              max_depth=10,          # tightened from 15
-                              min_samples_leaf=15,   # tightened from 10
-                              max_features=0.2)      # tightened from 0.3
+                              max_depth=6,
+                              min_samples_leaf=20, 
+                              max_features=0.2)
