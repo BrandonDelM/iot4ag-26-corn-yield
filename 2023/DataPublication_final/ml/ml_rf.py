@@ -236,8 +236,9 @@ def parse_filename(imagename_col):
 # ─────────────────────────────────────────────
 
 def run_random_forest(features_df, groundtruth_df,
-                      n_estimators=300, max_depth=None,
-                      min_samples_leaf=2, n_jobs=-1):
+                      n_estimators=300, max_depth=15,
+                      min_samples_leaf=10, max_features=0.3,
+                      n_jobs=-1):
 
     # ── Merge features with ground truth ──
     sat_col = [c for c in features_df.columns if 'Imagename' in c]
@@ -253,17 +254,129 @@ def run_random_forest(features_df, groundtruth_df,
     groundtruth_df['row']        = groundtruth_df['row'].astype(str)
     groundtruth_df['experiment'] = groundtruth_df['experiment'].astype(str)
 
+    # ── Encode nitrogenTreatment as ordered number ──
+    nitrogen_map = {'Low': 0, 'Medium': 1, 'High': 2}
+    groundtruth_df['nitrogenTreatment_enc'] = (
+        groundtruth_df['nitrogenTreatment'].map(nitrogen_map)
+    )
+
+    # ── Encode genotype as integer ──
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    groundtruth_df['genotype_enc'] = le.fit_transform(
+        groundtruth_df['genotype'].astype(str)
+    )
+
+    # ── Encode location ──
+    groundtruth_df['location_enc'] = (groundtruth_df['location'] == 'Lincoln').astype(int)
+
+    # ── IDEA 3: Genotype mean yield ──
+    # Each genotype's average yield across all plots gives the model
+    # a strong prior on how well each variety typically performs
+    geno_mean = (groundtruth_df.groupby('genotype')['yieldPerAcre']
+                 .mean()
+                 .rename('genotype_mean_yield'))
+    groundtruth_df = groundtruth_df.join(geno_mean, on='genotype')
+    print(f"\nGenotype mean yield added ({groundtruth_df['genotype_mean_yield'].nunique()} unique values)")
+
+    AGRONOMIC_FEATURES = [
+        'nitrogenTreatment_enc',
+        'GDDToAnthesis',
+        'daysToAnthesis',
+        'genotype_enc',
+        'genotype_mean_yield',     # NEW: average yield for this variety
+        'location_enc',
+        'block',
+    ]
+
     merged = features_df.merge(
-        groundtruth_df[['location', 'range', 'row', 'experiment', 'yieldPerAcre']],
+        groundtruth_df[['location', 'range', 'row', 'experiment', 'yieldPerAcre']
+                       + AGRONOMIC_FEATURES],
         on=['location', 'range', 'row', 'experiment'],
         how='inner'
     )
 
     print(f"\nMerged dataset: {len(merged)} rows")
-    print(f"Total patch features: {len([c for c in merged.columns if 'patch' in c])}")
+    print(f"  Patch image features : {len([c for c in merged.columns if 'patch' in c])}")
+    print(f"  Agronomic features   : {len(AGRONOMIC_FEATURES)}")
     if len(merged) == 0:
         print("No matching rows after merge.")
         return
+
+    # ── IDEA 2: Temporal features ──
+    # For each plot, compute the change in key indices between timepoints.
+    # The rate of green-up or senescence is often more predictive than
+    # the index value at any single point.
+    print("\nBuilding temporal delta features...")
+
+    # Get patch index mean columns only (use mean as the representative value per patch)
+    index_names = ['NDVI', 'GNDVI', 'SAVI', 'GLI', 'NGRDI']
+    patch_positions = [f'{pi}_{pj}' for pi in range(GRID_SIZE) for pj in range(GRID_SIZE)]
+
+    # Add plot key to merged for grouping
+    merged['_plot_key'] = (merged['location'].astype(str) + '_' +
+                           merged['range'].astype(str) + '_' +
+                           merged['row'].astype(str) + '_' +
+                           merged['experiment'].astype(str))
+
+    # Add timepoint back in for pivot (it was in meta but got dropped)
+    if 'timepoint' in merged.columns:
+        tp_col = 'timepoint'
+    else:
+        # Re-parse from Imagename if needed
+        sat_col2 = [c for c in merged.columns if 'Imagename' in c]
+        if sat_col2:
+            tp_series = merged[sat_col2[0]].apply(
+                lambda x: os.path.splitext(x)[0].split('-')[1] if isinstance(x, str) else None
+            )
+            merged['timepoint'] = tp_series
+            tp_col = 'timepoint'
+        else:
+            tp_col = None
+
+    temporal_rows = []
+    if tp_col and merged[tp_col].nunique() > 1:
+        timepoints = sorted(merged[tp_col].dropna().unique())
+        print(f"  Timepoints found: {timepoints}")
+
+        for plot_key, plot_group in merged.groupby('_plot_key'):
+            plot_group = plot_group.sort_values(tp_col)
+            tps = plot_group[tp_col].tolist()
+            delta_dict = {'_plot_key': plot_key}
+
+            # Compute delta between consecutive timepoints for each patch × index
+            for idx_name in index_names:
+                for patch_pos in patch_positions:
+                    col = f'patch_{patch_pos}_{idx_name}_mean'
+                    if col not in plot_group.columns:
+                        continue
+                    vals = plot_group[col].tolist()
+                    for t in range(1, len(vals)):
+                        delta_name = f'delta_{idx_name}_{patch_pos}_TP{t}to{t+1}'
+                        delta_dict[delta_name] = vals[t] - vals[t-1]
+
+            # Also compute whole-plot mean NDVI per timepoint (for trend summary)
+            ndvi_patch_cols = [c for c in plot_group.columns if 'NDVI_mean' in c and 'patch' in c]
+            for i, row_ in enumerate(plot_group.itertuples()):
+                tp_label = getattr(row_, tp_col)
+                plot_ndvi_vals = [getattr(row_, c.replace(' ', '_'), np.nan)
+                                  for c in ndvi_patch_cols]
+                delta_dict[f'mean_NDVI_{tp_label}'] = float(np.nanmean(plot_ndvi_vals))
+
+            temporal_rows.append(delta_dict)
+
+        if temporal_rows:
+            temporal_df = pd.DataFrame(temporal_rows)
+            n_delta_cols = len([c for c in temporal_df.columns if c.startswith('delta_')])
+            print(f"  Created {n_delta_cols} temporal delta features across {len(temporal_rows)} plots")
+            merged = merged.merge(temporal_df, on='_plot_key', how='left')
+        else:
+            print("  No temporal deltas computed — check timepoint column.")
+    else:
+        print("  Only one timepoint found — skipping temporal deltas.")
+
+    # Clean up helper columns
+    merged = merged.drop(columns=['_plot_key'], errors='ignore')
 
     # ── Prepare X and y ──
     drop_cols = [c for c in merged.columns if 'Imagename' in c] + \
@@ -274,31 +387,65 @@ def run_random_forest(features_df, groundtruth_df,
     X = merged[feature_cols].values.astype(np.float32)
     y = merged['yieldPerAcre'].values.astype(np.float32)
 
-    # ── Impute missing values (Random Forest doesn't need scaling) ──
+    # ── Impute missing values ──
     imputer = SimpleImputer(strategy='median')
     X = imputer.fit_transform(X)
 
-    # ── 70 / 15 / 15 split ──
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.30, random_state=42)
-    X_val,   X_test, y_val,   y_test = train_test_split(X_temp, y_temp, test_size=0.50, random_state=42)
+    # ── Remove low-variance features (patch features from border patches
+    #    are often all-NaN/zero after imputation and add noise) ──
+    from sklearn.feature_selection import VarianceThreshold
+    selector = VarianceThreshold(threshold=0.01)
+    X = selector.fit_transform(X)
+    feature_cols_filtered = [f for f, keep in zip(feature_cols, selector.get_support()) if keep]
+    n_patch = len([f for f in feature_cols_filtered if 'patch' in f])
+    n_delta = len([f for f in feature_cols_filtered if f.startswith('delta_') or 'mean_NDVI' in f])
+    n_agro  = len([f for f in feature_cols_filtered if 'patch' not in f
+                   and not f.startswith('delta_') and 'mean_NDVI' not in f])
+    print(f"  Features after variance filter: {len(feature_cols_filtered)} / {len(feature_cols)}")
+    print(f"    → {n_patch} patch/image features")
+    print(f"    → {n_delta} temporal delta features")
+    print(f"    → {n_agro} agronomic features")
 
-    print(f"\nData split:")
+    # ── Stratified 70 / 15 / 15 split by yield range ──
+    # Bins yield into 4 equal groups so low/high yield plots are
+    # proportionally represented in all three sets
+    y_bins = pd.qcut(y, q=4, labels=False)
+
+    X_train, X_temp, y_train, y_temp, bins_train, bins_temp = train_test_split(
+        X, y, y_bins, test_size=0.30, random_state=42, stratify=y_bins
+    )
+    X_val, X_test, y_val, y_test, _, _ = train_test_split(
+        X_temp, y_temp, bins_temp, test_size=0.50, random_state=42, stratify=bins_temp
+    )
+
+    print(f"\nData split (stratified by yield range):")
     print(f"  Train      : {len(X_train)} samples ({len(X_train)/len(X)*100:.0f}%)")
     print(f"  Validation : {len(X_val)} samples ({len(X_val)/len(X)*100:.0f}%)")
     print(f"  Test       : {len(X_test)} samples ({len(X_test)/len(X)*100:.0f}%)")
+    print(f"  Yield range in test  : {y_test.min():.1f} – {y_test.max():.1f} bu/acre")
+    print(f"  Yield range in train : {y_train.min():.1f} – {y_train.max():.1f} bu/acre")
 
-    # ── Train Random Forest ──
+    # ── Train Random Forest with tighter regularization ──
     print(f"\nTraining Random Forest ({n_estimators} trees)...")
+    print(f"  max_depth={max_depth}, min_samples_leaf={min_samples_leaf}, max_features={max_features}")
     model = RandomForestRegressor(
         n_estimators=n_estimators,
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        max_samples=0.8,
         n_jobs=n_jobs,
         random_state=42,
-        oob_score=True      # free validation estimate using out-of-bag samples
+        oob_score=True
     )
     model.fit(X_train, y_train)
     print(f"  Done. Out-of-bag R² (train): {model.oob_score_:.3f}")
+
+    # ── 5-fold cross-validation on train set to check stability ──
+    from sklearn.model_selection import cross_val_score
+    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2', n_jobs=-1)
+    print(f"\n  5-fold CV on train: R² = {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    print(f"  (if this is much lower than train R², the model is still overfitting)")
 
     # ── Evaluate on all three splits ──
     y_pred_train = model.predict(X_train)
@@ -322,13 +469,23 @@ def run_random_forest(features_df, groundtruth_df,
     print("\n========================================")
     print("       MODEL ACCURACY REPORT")
     print("========================================")
-    print_metrics("TRAIN SET", y_train, y_pred_train)
-    print_metrics("VALIDATION", y_val, y_pred_val)
-    print_metrics("TEST SET  (true accuracy — never seen during training)", y_test, y_pred_test)
+    r2_train, _, _ = print_metrics("TRAIN SET", y_train, y_pred_train)
+    r2_val,   _, _ = print_metrics("VALIDATION", y_val, y_pred_val)
+    r2_test,  _, _ = print_metrics("TEST SET  (true accuracy — never seen during training)", y_test, y_pred_test)
 
-    # ── Feature importances ── top 20
+    gap = r2_train - r2_test
+    print(f"\n  Overfit gap (train R² - test R²): {gap:.3f}")
+    if gap > 0.2:
+        print("  ⚠ Gap > 0.2 — model is overfitting. Try increasing max_depth limit,")
+        print("    min_samples_leaf, or reducing GRID_SIZE to shrink the feature count.")
+    elif gap > 0.1:
+        print("  ⚠ Mild overfitting. Consider tuning further.")
+    else:
+        print("  ✓ Train/test gap looks reasonable.")
+
+    # ── Feature importances — top 20 ──
     importance_df = pd.DataFrame({
-        'feature':    feature_cols,
+        'feature':    feature_cols_filtered,
         'importance': model.feature_importances_
     }).sort_values('importance', ascending=False).head(20)
 
@@ -336,7 +493,8 @@ def run_random_forest(features_df, groundtruth_df,
     print(importance_df.to_string(index=False))
 
     # ── Save model ──
-    joblib.dump({'model': model, 'imputer': imputer, 'feature_cols': feature_cols},
+    joblib.dump({'model': model, 'imputer': imputer, 'selector': selector,
+                 'feature_cols': feature_cols_filtered},
                 'best_model.pkl')
     print("\nModel saved → best_model.pkl")
 
@@ -434,5 +592,6 @@ if __name__ == '__main__':
     print("\nRunning Random Forest with patch features...")
     model = run_random_forest(features_df, groundtruth,
                               n_estimators=300,
-                              max_depth=None,
-                              min_samples_leaf=2)
+                              max_depth=10,          # tightened from 15
+                              min_samples_leaf=15,   # tightened from 10
+                              max_features=0.2)      # tightened from 0.3
