@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import rasterio
+import datetime # NEW
+import torch.nn.functional as F
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -17,6 +19,7 @@ from xgboost import XGBRegressor
 import joblib
 
 warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide")
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
 # ─────────────────────────────────────────────
 # 1. PYTORCH DATASET (CAE PREP)
@@ -91,21 +94,31 @@ class CAESatelliteDataset(Dataset):
             else:
                 bands[b] = 0.0
                 
+        # ... [keep your existing rasterio loading and NaN-filling code] ...
         bands = np.nan_to_num(bands, nan=0.0)
 
-        # Slice into 1x2 grid
-        _, H, W = bands.shape
+        # 1. Convert numpy array to tensor
+        bands_tensor = torch.tensor(bands, dtype=torch.float32)
+
+        # 2. NEW: Standardize spatial size to fix the DataLoader stacking error
+        # Add a fake batch dim (1, C, H, W) for interpolate, resize to 24x12, then remove it
+        bands_tensor = bands_tensor.unsqueeze(0)
+        bands_tensor = F.interpolate(bands_tensor, size=(24, 12), mode='bilinear', align_corners=False)
+        bands_tensor = bands_tensor.squeeze(0)
+
+        # 3. Slice the newly standardized tensor into the 1x2 grid
+        C, H, W = bands_tensor.shape
         ph, pw = H // self.grid_rows, W // self.grid_cols
         
         patches = []
         for pi in range(self.grid_rows):
             for pj in range(self.grid_cols):
-                patch = bands[:, pi*ph:(pi+1)*ph, pj*pw:(pj+1)*pw]
+                patch = bands_tensor[:, pi*ph:(pi+1)*ph, pj*pw:(pj+1)*pw]
                 patches.append(patch)
                 
-        patches_tensor = torch.tensor(np.stack(patches), dtype=torch.float32)
-        
-        # Return index too so we can map latents back to the dataframe
+        # 4. Stack into a single tensor: Shape will now consistently be (2, 6, 24, 6)
+        patches_tensor = torch.stack(patches)
+
         return patches_tensor, geno_id, env_id, yield_val, idx
 
 
@@ -190,7 +203,12 @@ def extract_cae_features(dataset, cae_model, device='cuda', batch_size=16):
 
 def run_xgboost_on_latents(features_df, latent_cols,
                            n_estimators=300, max_depth=15,
-                           min_samples_leaf=10, max_features=0.3):
+                           min_samples_leaf=10, max_features=0.3, 
+                           run_id=None):
+
+    # Generate a unique ID if one wasn't provided
+    if run_id is None:
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # ── Encode Categories ──
     features_df['nitrogenTreatment_enc'] = features_df['nitrogenTreatment'].map({'Low': 0, 'Medium': 1, 'High': 2})
@@ -210,16 +228,13 @@ def run_xgboost_on_latents(features_df, latent_cols,
         'gxe_mean_yield', 'location_enc', 'block'
     ]
 
-    # Combine latent columns and agronomic columns
     feature_cols = latent_cols + AGRONOMIC_FEATURES
-    
-    # Drop rows with missing targets
     merged = features_df.dropna(subset=['yieldPerAcre'] + AGRONOMIC_FEATURES)
 
-    X = merged[feature_cols].values.astype(np.float32)
-    y = merged['yieldPerAcre'].values.astype(np.float32)
+    # Force contiguous memory to prevent C++ backend segfaults
+    X = np.ascontiguousarray(merged[feature_cols].values.astype(np.float32))
+    y = np.ascontiguousarray(merged['yieldPerAcre'].values.astype(np.float32))
 
-    # Impute and threshold
     imputer = SimpleImputer(strategy='median')
     X = imputer.fit_transform(X)
 
@@ -236,20 +251,40 @@ def run_xgboost_on_latents(features_df, latent_cols,
     model = XGBRegressor(
         n_estimators=n_estimators, max_depth=max_depth, learning_rate=0.05,
         subsample=0.8, colsample_bytree=max_features, min_child_weight=min_samples_leaf,
-        random_state=42, n_jobs=-1, verbosity=0, reg_alpha=0.1, reg_lambda=2.0
+        random_state=42, n_jobs=1, verbosity=0, reg_alpha=0.1, reg_lambda=2.0
     )
     model.fit(X_train, y_train)
 
     # ── Evaluation ──
-    y_pred_train = model.predict(X_train)
     y_pred_test  = model.predict(X_test)
+    r2_test = r2_score(y_test, y_pred_test)
+    mae_test = mean_absolute_error(y_test, y_pred_test)
 
     print("\n  === TEST SET ===")
-    print(f"  R²   : {r2_score(y_test, y_pred_test):.3f}")
-    print(f"  MAE  : {mean_absolute_error(y_test, y_pred_test):.2f} bu/acre")
+    print(f"  R²   : {r2_test:.3f}")
+    print(f"  MAE  : {mae_test:.2f} bu/acre")
     print(f"  RMSE : {np.sqrt(mean_squared_error(y_test, y_pred_test)):.2f} bu/acre")
 
-    # Feature Importances
+    # ── Plot 1: Predicted vs Actual (Error Plot) ──
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(y_test, y_pred_test, alpha=0.6, color='steelblue', edgecolors='k')
+    
+    # Draw the perfect fit line
+    mn, mx = min(y_test.min(), y_pred_test.min()), max(y_test.max(), y_pred_test.max())
+    ax.plot([mn, mx], [mn, mx], 'r--', label='Perfect Prediction')
+    
+    ax.set_xlabel('Actual Yield (bu/acre)')
+    ax.set_ylabel('Predicted Yield (bu/acre)')
+    ax.set_title(f'CAE + XGBoost Error | Run: {run_id}\nR² = {r2_test:.3f} | MAE = {mae_test:.1f}')
+    ax.legend()
+    plt.tight_layout()
+    
+    plot_filename = f'./data/error_plot_{run_id}.png'
+    plt.savefig(plot_filename, dpi=150)
+    plt.close() # Close to free memory
+    print(f"\nSaved error plot → {plot_filename}")
+
+    # ── Feature Importances ──
     importance_df = pd.DataFrame({
         'feature': feature_cols,
         'importance': model.feature_importances_
@@ -258,7 +293,24 @@ def run_xgboost_on_latents(features_df, latent_cols,
     print("\n  === Top 15 Features ===")
     print(importance_df.to_string(index=False))
 
-    joblib.dump({'model': model, 'imputer': imputer, 'feature_cols': feature_cols}, 'best_cae_xgb_model.pkl')
+    # ── Save Model ──
+    model_filename = f'./data/best_cae_xgb_model_{run_id}.pkl'
+    joblib.dump({'model': model, 'imputer': imputer, 'feature_cols': feature_cols, 'run_id': run_id}, model_filename)
+    print(f"Saved model → {model_filename}")
+
+    # ── Save Predictions to CSV ──
+    predictions_df = pd.DataFrame({
+        'Actual_Yield': y_test,
+        'Predicted_Yield': y_pred_test,
+        'Error': y_pred_test - y_test,
+        'Absolute_Error': np.abs(y_pred_test - y_test),
+        'Pct_Error': np.abs((y_test - y_pred_test) / y_test) * 100
+    })
+    
+    csv_filename = f'./data/predictions_{run_id}.csv'
+    predictions_df.to_csv(csv_filename, index=False)
+    print(f"Saved test predictions → {csv_filename}")
+
     return model
 
 
