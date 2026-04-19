@@ -105,8 +105,43 @@ with col_inputs:
 
     if st.button("Generate Digital Twin & Forecast Yield", type="primary"):
         logger.info(f"Twin generation requested — G={genotype}, E={planting_date}, M={nitrogen}")
-        with st.spinner("Calculating Growing Degree Days & analyzing 6 spectral bands…"):
-            time.sleep(2)
+
+        # ── Real inference path: both files uploaded ──────────────
+        if sat_file and csv_file:
+            import os
+            ml_dir = os.path.join(os.path.dirname(__file__), "..", "2023", "DataPublication_final", "ml")
+            repo_root = os.path.join(os.path.dirname(__file__), "..")
+
+            # Save uploaded files to temp locations
+            temp_zip = os.path.join(repo_root, "temp_upload.zip")
+            temp_csv = os.path.join(repo_root, "temp_metadata.csv")
+            model_path = os.path.join(repo_root, "best_model.pkl")
+
+            with open(temp_zip, "wb") as f:
+                f.write(sat_file.getbuffer())
+            with open(temp_csv, "wb") as f:
+                f.write(csv_file.getbuffer())
+
+            if os.path.exists(model_path):
+                with st.spinner("Running XGBoost inference on uploaded imagery..."):
+                    try:
+                        sys.path.insert(0, ml_dir)
+                        import run_inference
+                        run_inference.process_zip_upload(temp_zip, temp_csv, model_path)
+                        st.session_state["real_data"] = True
+                        logger.info("Real inference pipeline completed successfully.")
+                    except Exception as e:
+                        st.error(f"Inference failed: {e}")
+                        logger.error(f"Inference error: {e}")
+                        st.session_state["real_data"] = False
+            else:
+                st.error("Model file `best_model.pkl` not found in repo root.")
+                st.session_state["real_data"] = False
+        else:
+            # ── Mock path: no files uploaded ──────────────────────
+            with st.spinner("Calculating Growing Degree Days & analyzing 6 spectral bands..."):
+                time.sleep(2)
+            st.session_state["real_data"] = False
 
         st.session_state["setup_done"] = True
         st.session_state["genotype"]   = genotype
@@ -115,3 +150,4 @@ with col_inputs:
 
         st.success("Digital Twin generated. Navigate to **Harvest Forecast** to view results.")
         st.rerun()
+

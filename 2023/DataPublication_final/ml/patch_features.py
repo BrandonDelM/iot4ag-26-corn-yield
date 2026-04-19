@@ -176,8 +176,8 @@ def collect_all_satellite(image_root='../Satellite', grid_size=4):
         return pd.DataFrame()
 
     results = []
-    print(f"Going through all {len(all_tif)} tif files")
     for i, filepath in enumerate(all_tif):
+        print(f"  Satellite [{i+1}/{len(all_tif)}]: {os.path.basename(filepath)}")
         try:
             row = satelliteimage_patches(filepath, grid_size=grid_size)
             results.append(row)
@@ -188,8 +188,13 @@ def collect_all_satellite(image_root='../Satellite', grid_size=4):
 
 
 def collect_all_rgb(image_root='../UAV', grid_size=4):
-    all_rgb = glob.glob(os.path.join(image_root, '**', '*.jpg'), recursive=True)
-    all_rgb += glob.glob(os.path.join(image_root, '**', '*.png'), recursive=True)
+    # REMOVED .tif and .tiff from this list so it stops crashing!
+    valid_extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
+    
+    all_rgb = []
+    import glob
+    for ext in valid_extensions:
+        all_rgb.extend(glob.glob(os.path.join(image_root, '**', ext), recursive=True))
 
     if not all_rgb:
         print(f"No RGB files found under {image_root}")
@@ -238,16 +243,9 @@ def parse_filename(imagename_col):
 def run_random_forest(features_df, groundtruth_df,
                       n_estimators=300, max_depth=15,
                       min_samples_leaf=10, max_features=0.3,
-                      n_jobs=1): # Set to 1 to avoid C++ threading segfaults
+                      n_jobs=-1):
 
-    from sklearn.preprocessing import LabelEncoder
-    from sklearn.impute import SimpleImputer
-    from sklearn.feature_selection import VarianceThreshold
-    from sklearn.model_selection import train_test_split
-    from xgboost import XGBRegressor
-    import numpy as np
-
-    # ── 1. Merge features with ground truth ──
+    # ── Merge features with ground truth ──
     sat_col = [c for c in features_df.columns if 'Imagename' in c]
     if not sat_col:
         print("Could not find Imagename column.")
@@ -261,59 +259,94 @@ def run_random_forest(features_df, groundtruth_df,
     groundtruth_df['row']        = groundtruth_df['row'].astype(str)
     groundtruth_df['experiment'] = groundtruth_df['experiment'].astype(str)
 
-    # Encode basic categoricals (No leakage risk here)
+    # ── Encode nitrogenTreatment as ordered number ──
     nitrogen_map = {'Low': 0, 'Medium': 1, 'High': 2}
-    groundtruth_df['nitrogenTreatment_enc'] = groundtruth_df['nitrogenTreatment'].map(nitrogen_map)
-    
+    groundtruth_df['nitrogenTreatment_enc'] = (
+        groundtruth_df['nitrogenTreatment'].map(nitrogen_map)
+    )
+
+    # ── Encode genotype as integer ──
+    from sklearn.preprocessing import LabelEncoder
     le = LabelEncoder()
-    groundtruth_df['genotype_enc'] = le.fit_transform(groundtruth_df['genotype'].astype(str))
+    groundtruth_df['genotype_enc'] = le.fit_transform(
+        groundtruth_df['genotype'].astype(str)
+    )
+
+    # ── Encode location ──
     groundtruth_df['location_enc'] = (groundtruth_df['location'] == 'Lincoln').astype(int)
 
+    # NOTE: genotype_mean_yield is intentionally NOT computed here.
+    # Computing it on the full dataset before splitting causes leakage —
+    # test plots would have their own yield baked into their features.
+    # It is computed from train data only after the split below.
+
     AGRONOMIC_FEATURES = [
-        'nitrogenTreatment_enc', 'GDDToAnthesis', 'daysToAnthesis',
-        'genotype_enc', 'location_enc', 'block'
+        'nitrogenTreatment_enc',
+        'GDDToAnthesis',
+        'daysToAnthesis',
+        'genotype_enc',
+        'genotype_mean_yield',     # computed from train only — see below
+        'location_enc',
+        'block',
     ]
 
     merged = features_df.merge(
         groundtruth_df[['location', 'range', 'row', 'experiment', 'yieldPerAcre',
-                        'genotype', 'nitrogenTreatment'] + AGRONOMIC_FEATURES],
+                        'genotype', 'nitrogenTreatment']   # raw strings for metadata
+                       + [f for f in AGRONOMIC_FEATURES if f != 'genotype_mean_yield']],
         on=['location', 'range', 'row', 'experiment'],
         how='inner'
     )
-    
-    merged = merged.dropna(subset=['yieldPerAcre'])
+
+    print(f"\nMerged dataset: {len(merged)} rows")
+    print(f"  Patch image features : {len([c for c in merged.columns if 'patch' in c])}")
+    print(f"  Agronomic features   : {len(AGRONOMIC_FEATURES)}")
     if len(merged) == 0:
         print("No matching rows after merge.")
         return
 
-    # ── 2. Build temporal delta features ──
+    # ── IDEA 2: Temporal features ──
+    # For each plot, compute the change in key indices between timepoints.
+    # The rate of green-up or senescence is often more predictive than
+    # the index value at any single point.
     print("\nBuilding temporal delta features...")
-    # NOTE: You need to ensure GRID_SIZE is defined globally or passed in
-    GRID_SIZE = 2 
+
+    # Get patch index mean columns only (use mean as the representative value per patch)
     index_names = ['NDVI', 'GNDVI', 'SAVI', 'GLI', 'NGRDI']
     patch_positions = [f'{pi}_{pj}' for pi in range(GRID_SIZE) for pj in range(GRID_SIZE)]
 
+    # Add plot key to merged for grouping
     merged['_plot_key'] = (merged['location'].astype(str) + '_' +
                            merged['range'].astype(str) + '_' +
                            merged['row'].astype(str) + '_' +
                            merged['experiment'].astype(str))
 
-    sat_col2 = [c for c in merged.columns if 'Imagename' in c]
-    if sat_col2:
-        merged['timepoint'] = merged[sat_col2[0]].apply(
-            lambda x: os.path.splitext(x)[0].split('-')[1] if isinstance(x, str) else None
-        )
+    # Add timepoint back in for pivot (it was in meta but got dropped)
+    if 'timepoint' in merged.columns:
         tp_col = 'timepoint'
     else:
-        tp_col = None
+        # Re-parse from Imagename if needed
+        sat_col2 = [c for c in merged.columns if 'Imagename' in c]
+        if sat_col2:
+            tp_series = merged[sat_col2[0]].apply(
+                lambda x: os.path.splitext(x)[0].split('-')[1] if isinstance(x, str) else None
+            )
+            merged['timepoint'] = tp_series
+            tp_col = 'timepoint'
+        else:
+            tp_col = None
 
     temporal_rows = []
     if tp_col and merged[tp_col].nunique() > 1:
+        timepoints = sorted(merged[tp_col].dropna().unique())
+        print(f"  Timepoints found: {timepoints}")
+
         for plot_key, plot_group in merged.groupby('_plot_key'):
             plot_group = plot_group.sort_values(tp_col)
-            vals_list = plot_group[tp_col].tolist()
+            tps = plot_group[tp_col].tolist()
             delta_dict = {'_plot_key': plot_key}
 
+            # Compute delta between consecutive timepoints for each patch × index
             for idx_name in index_names:
                 for patch_pos in patch_positions:
                     col = f'patch_{patch_pos}_{idx_name}_mean'
@@ -324,271 +357,239 @@ def run_random_forest(features_df, groundtruth_df,
                         delta_name = f'delta_{idx_name}_{patch_pos}_TP{t}to{t+1}'
                         delta_dict[delta_name] = vals[t] - vals[t-1]
 
+            # Also compute whole-plot mean NDVI per timepoint (for trend summary)
             ndvi_patch_cols = [c for c in plot_group.columns if 'NDVI_mean' in c and 'patch' in c]
-            for row_ in plot_group.itertuples():
+            for i, row_ in enumerate(plot_group.itertuples()):
                 tp_label = getattr(row_, tp_col)
-                plot_ndvi_vals = [getattr(row_, c.replace(' ', '_'), np.nan) for c in ndvi_patch_cols]
+                plot_ndvi_vals = [getattr(row_, c.replace(' ', '_'), np.nan)
+                                  for c in ndvi_patch_cols]
                 delta_dict[f'mean_NDVI_{tp_label}'] = float(np.nanmean(plot_ndvi_vals))
 
             temporal_rows.append(delta_dict)
 
         if temporal_rows:
             temporal_df = pd.DataFrame(temporal_rows)
+            n_delta_cols = len([c for c in temporal_df.columns if c.startswith('delta_')])
+            print(f"  Created {n_delta_cols} temporal delta features across {len(temporal_rows)} plots")
             merged = merged.merge(temporal_df, on='_plot_key', how='left')
-            print(f"  Created temporal features for {len(temporal_rows)} plots.")
+        else:
+            print("  No temporal deltas computed — check timepoint column.")
+    else:
+        print("  Only one timepoint found — skipping temporal deltas.")
 
+    # Clean up helper columns
     merged = merged.drop(columns=['_plot_key'], errors='ignore')
 
-    # ── 3. LEAKAGE FIX #1: Spatial Group Splitting ──
-    print("\nSplitting data spatially by Block to prevent adjacency leakage...")
+    # ── Keep metadata columns for the scoring engine output ──
+    METADATA_COLS = ['location', 'range', 'row', 'experiment',
+                     'genotype', 'nitrogenTreatment', 'timepoint']
+    # Only keep columns that actually exist in merged
+    meta_cols_present = [c for c in METADATA_COLS if c in merged.columns]
+    metadata = merged[meta_cols_present].reset_index(drop=True)
+
+    # ── Prepare X and y ──
     drop_cols = [c for c in merged.columns if 'Imagename' in c] + \
                 ['location', 'timepoint', 'experiment', 'range', 'row',
-                 'genotype', 'nitrogenTreatment', 'yieldPerAcre']
-                 
-    from sklearn.model_selection import GroupShuffleSplit
-    
-    # Create a unique Spatial Group ID based on Location and Block
-    merged['spatial_group'] = merged['location'] + "_" + merged['block'].astype(str)
-    
-    # 1. Split out the Test Set (20% of spatial blocks)
-    gss_test = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
-    train_val_idx, test_idx = next(gss_test.split(merged, groups=merged['spatial_group']))
-    
-    train_val_df = merged.iloc[train_val_idx].copy()
-    test_df = merged.iloc[test_idx].copy()
-    
-    # 2. Split the remaining blocks into Train (80%) and Val (20%)
-    gss_val = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
-    train_idx, val_idx = next(gss_val.split(train_val_df, groups=train_val_df['spatial_group']))
-    
-    train_df = train_val_df.iloc[train_idx].copy()
-    val_df = train_val_df.iloc[val_idx].copy()
-    
-    print(f"  Spatial blocks in Train: {train_df['spatial_group'].nunique()}")
-    print(f"  Spatial blocks in Val: {val_df['spatial_group'].nunique()}")
-    print(f"  Spatial blocks in Test: {test_df['spatial_group'].nunique()}")
-    
-    # Clean up the grouping column so it doesn't get used as a feature
-    for df in [train_df, val_df, test_df]:
-        df.drop(columns=['spatial_group'], inplace=True)
+                 'genotype', 'nitrogenTreatment']   # metadata only — not features
+    # genotype_mean_yield not in merged yet — added after split
+    feature_cols_base = [c for c in merged.columns
+                         if c not in drop_cols + ['yieldPerAcre', 'genotype_mean_yield']]
 
-# ── 4. LEAKAGE FIX #2: Leave-One-Out (LOO) Target Encoding ──
+    # ── SPLIT BY PLOT (not image row) ──────────────────────────────────────
+    # Each plot has multiple timepoint images. Splitting at the row level
+    # leaks the same plot's yield across train and test via different timepoints.
+    # Fix: assign all timepoints of a given plot to the same split.
+    plot_key_cols = ['location', 'range', 'row', 'experiment']
+    unique_plots = (merged[plot_key_cols + ['yieldPerAcre', 'genotype']]
+                    .drop_duplicates(subset=plot_key_cols)
+                    .reset_index(drop=True))
+
+    y_bins_plots = pd.qcut(unique_plots['yieldPerAcre'], q=4, labels=False, duplicates='drop')
+    train_plots, temp_plots = train_test_split(
+        unique_plots, test_size=0.30, random_state=42, stratify=y_bins_plots
+    )
+    temp_bins = pd.qcut(temp_plots['yieldPerAcre'], q=4, labels=False, duplicates='drop')
+    val_plots, test_plots = train_test_split(
+        temp_plots, test_size=0.50, random_state=42, stratify=temp_bins
+    )
+
+    def tag_split(df, train_p, val_p, key_cols):
+        train_keys = set(map(tuple, train_p[key_cols].values))
+        val_keys   = set(map(tuple, val_p[key_cols].values))
+        return df[key_cols].apply(tuple, axis=1).map(
+            lambda k: 'train' if k in train_keys else ('val' if k in val_keys else 'test')
+        )
+
+    merged['split'] = tag_split(merged, train_plots, val_plots, plot_key_cols)
+    train_df = merged[merged['split'] == 'train'].copy()
+    val_df   = merged[merged['split'] == 'val'].copy()
+    test_df  = merged[merged['split'] == 'test'].copy()
+
+    print(f"\nPlot-level split (no timepoint leakage):")
+    print(f"  Unique plots — train: {train_df[plot_key_cols].drop_duplicates().shape[0]}"
+          f" | val: {val_df[plot_key_cols].drop_duplicates().shape[0]}"
+          f" | test: {test_df[plot_key_cols].drop_duplicates().shape[0]}")
+    print(f"  Image rows  — train: {len(train_df)} | val: {len(val_df)} | test: {len(test_df)}")
+    unseen = len(set(test_df['genotype']) - set(train_df['genotype']))
+    print(f"  Genotypes in test not seen in train: {unseen}")
+
+    # ── LEAKAGE FIX: genotype_mean_yield from train only ──────────────────
+    # Computing this on the full dataset before splitting would leak test
+    # yields into the features. Compute on train, apply to all splits.
+    train_geno_mean = (train_df.groupby('genotype')['yieldPerAcre']
+                       .mean().rename('genotype_mean_yield'))
     global_mean = train_df['yieldPerAcre'].mean()
 
-    # NEW: Create env_str so the groupby function has something to group by
-    for df in [train_df, val_df, test_df]:
-        df['env_str'] = df['location'] + "_" + df['nitrogenTreatment'].astype(str)
+    for df_split in [train_df, val_df, test_df]:
+        df_split['genotype_mean_yield'] = (
+            df_split['genotype'].map(train_geno_mean).fillna(global_mean)
+        )
 
-    # 1. Calculate standard dictionary means to apply to the validation/test sets later
-    train_geno_mean_dict = train_df.groupby('genotype')['yieldPerAcre'].mean().rename('genotype_mean_yield')
-    train_gxe_mean_dict = train_df.groupby(['genotype', 'env_str'])['yieldPerAcre'].mean().rename('gxe_mean_yield')
+    print(f"  genotype_mean_yield computed from train only (global fallback: {global_mean:.1f})")
 
-    # 2. For the TRAIN set ONLY, use LOO so a row's own yield isn't in its feature
-    train_df['geno_count'] = train_df.groupby('genotype')['yieldPerAcre'].transform('count')
-    train_df['geno_sum'] = train_df.groupby('genotype')['yieldPerAcre'].transform('sum')
-    train_df['genotype_mean_yield'] = np.where(
-        train_df['geno_count'] > 1,
-        (train_df['geno_sum'] - train_df['yieldPerAcre']) / (train_df['geno_count'] - 1),
-        global_mean # Fallback if this is the only plot for this genotype
-    )
-
-    train_df['gxe_count'] = train_df.groupby(['genotype', 'env_str'])['yieldPerAcre'].transform('count')
-    train_df['gxe_sum'] = train_df.groupby(['genotype', 'env_str'])['yieldPerAcre'].transform('sum')
-    train_df['gxe_mean_yield'] = np.where(
-        train_df['gxe_count'] > 1,
-        (train_df['gxe_sum'] - train_df['yieldPerAcre']) / (train_df['gxe_count'] - 1),
-        train_df['genotype_mean_yield'] 
-    )
-
-    # 3. For Val and Test sets, safely map the standard dictionaries
-    def apply_test_priors(df):
-        df = df.join(train_geno_mean_dict, on='genotype')
-        df['genotype_mean_yield'] = df['genotype_mean_yield'].fillna(global_mean)
-        
-        df = df.join(train_gxe_mean_dict, on=['genotype', 'env_str'])
-        df['gxe_mean_yield'] = df['gxe_mean_yield'].fillna(df['genotype_mean_yield'])
-        return df
-
-    val_df = apply_test_priors(val_df)
-    test_df = apply_test_priors(test_df)
-    
-    # Clean up the math helper columns before giving data to XGBoost
-    train_df = train_df.drop(columns=['geno_count', 'geno_sum', 'gxe_count', 'gxe_sum'])
-
-    # ── Re-assemble feature columns and convert to Numpy Arrays ──
-    feature_cols = [c for c in train_df.columns if c not in drop_cols and c != 'env_str']
+    # Full feature list now includes genotype_mean_yield
+    feature_cols = feature_cols_base + ['genotype_mean_yield']
 
     def prep_xy(df):
-        return (np.ascontiguousarray(df[feature_cols].values.astype(np.float32)), 
+        return (np.ascontiguousarray(df[feature_cols].values.astype(np.float32)),
                 np.ascontiguousarray(df['yieldPerAcre'].values.astype(np.float32)))
 
     X_train, y_train = prep_xy(train_df)
-    X_val, y_val = prep_xy(val_df)
-    X_test, y_test = prep_xy(test_df)
+    X_val,   y_val   = prep_xy(val_df)
+    X_test,  y_test  = prep_xy(test_df)
 
-    # ── 5. LEAKAGE FIX #3: Fit Imputer & Selector strictly on Train Data ──
+    # ── LEAKAGE FIX: fit imputer and selector on train only ───────────────
     imputer = SimpleImputer(strategy='median')
-    X_train = imputer.fit_transform(X_train)
-    X_val = imputer.transform(X_val)
-    X_test = imputer.transform(X_test)
+    X_train = imputer.fit_transform(X_train)   # fit on train only
+    X_val   = imputer.transform(X_val)          # transform with train stats
+    X_test  = imputer.transform(X_test)         # transform with train stats
 
+    from sklearn.feature_selection import VarianceThreshold
     selector = VarianceThreshold(threshold=0.01)
-    X_train = selector.fit_transform(X_train)
-    X_val = selector.transform(X_val)
-    X_test = selector.transform(X_test)
+    X_train = selector.fit_transform(X_train)   # fit on train only
+    X_val   = selector.transform(X_val)
+    X_test  = selector.transform(X_test)
 
-    # ── 5b. Smart Feature Selection (Shielding Priors) ──
-    print("\nPruning noisy drone features while protecting agronomic priors...")
-    from sklearn.feature_selection import SelectFromModel
-    from sklearn.ensemble import RandomForestRegressor
+    feature_cols_filtered = [f for f, keep in zip(feature_cols, selector.get_support()) if keep]
+    n_patch = len([f for f in feature_cols_filtered if 'patch' in f])
+    n_delta = len([f for f in feature_cols_filtered if f.startswith('delta_') or 'mean_NDVI' in f])
+    n_agro  = len([f for f in feature_cols_filtered if 'patch' not in f
+                   and not f.startswith('delta_') and 'mean_NDVI' not in f])
+    print(f"\n  Features after variance filter: {len(feature_cols_filtered)} / {len(feature_cols)}")
+    print(f"    → {n_patch} patch/image features")
+    print(f"    → {n_delta} temporal delta features")
+    print(f"    → {n_agro} agronomic features")
 
-    # 1. Identify which columns are strictly biological/agronomic
-    agronomic_keywords = ['genotype', 'gxe', 'nitrogen', 'GDD', 'days', 'location', 'block']
-    protected_cols = [c for c in feature_cols if any(k in c for k in agronomic_keywords)]
-    drone_cols = [c for c in feature_cols if c not in protected_cols]
-
-    # Get the indices for slicing the numpy arrays
-    protected_idx = [feature_cols.index(c) for c in protected_cols]
-    drone_idx = [feature_cols.index(c) for c in drone_cols]
-
-    # 2. Train the ranker ONLY on the drone imagery features
-    X_train_drone = X_train[:, drone_idx]
-    ranker = RandomForestRegressor(n_estimators=100, max_depth=4, random_state=42, n_jobs=n_jobs)
-    ranker.fit(X_train_drone, y_train)
-
-    # 3. Select the top 15 drone features
-    feature_selector = SelectFromModel(ranker, threshold=-np.inf, max_features=15)
-    feature_selector.fit(X_train_drone, y_train)
-    
-    # Extract the winning drone columns
-    rf_mask = feature_selector.get_support()
-    winning_drone_cols = [c for c, keep in zip(drone_cols, rf_mask) if keep]
-
-    # 4. Combine Protected + Winning Drone Features
-    feature_cols_filtered = protected_cols + winning_drone_cols
-    final_idx = protected_idx + [drone_idx[i] for i, keep in enumerate(rf_mask) if keep]
-
-    # Slice the actual numpy arrays to match the new columns
-    X_train = X_train[:, final_idx]
-    X_val = X_val[:, final_idx]
-    X_test = X_test[:, final_idx]
-
-    print(f"  Protected Agronomic Features: {len(protected_cols)}")
-    print(f"  Winning Drone Features: {len(winning_drone_cols)}")
-    print(f"  Top drone features kept: {winning_drone_cols[:3]}...")
-
-    # ── 6. Train XGBoost (Goldilocks Zone) ──
-    print(f"\nTraining XGBoost on core features...")
+    # ── Train XGBoost ──
+    print(f"\nTraining XGBoost ({n_estimators} trees)...")
+    print(f"  max_depth={max_depth}, min_samples_leaf={min_samples_leaf}, max_features={max_features}")
+    from xgboost import XGBRegressor
     model = XGBRegressor(
-        n_estimators=400,           
-        learning_rate=0.03,         
-        max_depth=4,                
-        min_child_weight=15,        
-        subsample=0.8,              
-        colsample_bytree=0.8,       # Let it see 24 of the 30 features per tree
-        reg_alpha=1.0,              
-        reg_lambda=2.0,             
-        random_state=42, 
-        n_jobs=n_jobs, 
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=max_features,
+        min_child_weight=min_samples_leaf,
+        random_state=42,
+        n_jobs=n_jobs,
         verbosity=0
     )
     model.fit(X_train, y_train)
+    print(f"  Done.")
 
-    # ── 7. Evaluate and Save ──
-    y_pred_test  = model.predict(X_test)
-    y_pred_val   = model.predict(X_val)
+    # ── 5-fold cross-validation on train set to check stability ──
+    from sklearn.model_selection import cross_val_score
+    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2', n_jobs=-1)
+    print(f"\n  5-fold CV on train: R² = {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    print(f"  (if this is much lower than train R², the model is still overfitting)")
+
+    # ── Evaluate on all three splits ──
     y_pred_train = model.predict(X_train)
+    y_pred_val   = model.predict(X_val)
+    y_pred_test  = model.predict(X_test)
 
-    print("\n  === TRAIN SET ===")
-    print(f"  R²   : {r2_score(y_train, y_pred_train):.3f}")
-    print(f"  MAE  : {mean_absolute_error(y_train, y_pred_train):.2f} bu/acre")
-    print(f"  RMSE : {np.sqrt(mean_squared_error(y_train, y_pred_train)):.2f} bu/acre")
+    def print_metrics(label, y_true, y_pred):
+        r2   = r2_score(y_true, y_pred)
+        mae  = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+        bias = np.mean(y_pred - y_true)
+        print(f"\n  === {label} ===")
+        print(f"  R²   : {r2:.3f}      (1.0 = perfect, 0 = no better than predicting the mean)")
+        print(f"  MAE  : {mae:.2f} bu/acre  (average absolute error per plot)")
+        print(f"  RMSE : {rmse:.2f} bu/acre  (penalises large errors more than MAE)")
+        print(f"  MAPE : {mape:.1f}%         (average % error relative to actual yield)")
+        print(f"  Bias : {bias:+.2f} bu/acre  (positive = over-predicts, negative = under-predicts)")
+        return r2, mae, rmse
 
-    print("\n  === VALIDATION SET ===")
-    print(f"  R²   : {r2_score(y_val, y_pred_val):.3f}")
-    print(f"  MAE  : {mean_absolute_error(y_val, y_pred_val):.2f} bu/acre")
-    print(f"  RMSE : {np.sqrt(mean_squared_error(y_val, y_pred_val)):.2f} bu/acre")
+    print("\n========================================")
+    print("       MODEL ACCURACY REPORT")
+    print("========================================")
+    r2_train, _, _ = print_metrics("TRAIN SET", y_train, y_pred_train)
+    r2_val,   _, _ = print_metrics("VALIDATION", y_val, y_pred_val)
+    r2_test,  _, _ = print_metrics("TEST SET  (true accuracy — never seen during training)", y_test, y_pred_test)
 
-    print("\n  === TRUE TEST SET (plot-level split — no timepoint leakage) ===")
-    print(f"  R²   : {r2_score(y_test, y_pred_test):.3f}")
-    print(f"  MAE  : {mean_absolute_error(y_test, y_pred_test):.2f} bu/acre")
-    print(f"  RMSE : {np.sqrt(mean_squared_error(y_test, y_pred_test)):.2f} bu/acre")
-    print(f"  Bias : {np.mean(y_pred_test - y_test):+.2f} bu/acre")
-
-    gap = r2_score(y_train, y_pred_train) - r2_score(y_test, y_pred_test)
+    gap = r2_train - r2_test
     print(f"\n  Overfit gap (train R² - test R²): {gap:.3f}")
+    if gap > 0.2:
+        print("  ⚠ Gap > 0.2 — model is overfitting. Try increasing max_depth limit,")
+        print("    min_samples_leaf, or reducing GRID_SIZE to shrink the feature count.")
+    elif gap > 0.1:
+        print("  ⚠ Mild overfitting. Consider tuning further.")
+    else:
+        print("  ✓ Train/test gap looks reasonable.")
 
-    # ── Predicted vs Actual plots ──
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    splits = [
-        ('Train',      y_train, y_pred_train, 'steelblue'),
-        ('Validation', y_val,   y_pred_val,   'darkorange'),
-        ('Test',       y_test,  y_pred_test,  'seagreen'),
-    ]
-    all_y = np.concatenate([y_train, y_val, y_test])
-    y_min, y_max = all_y.min() - 5, all_y.max() + 5
-
-    for ax, (label, y_true, y_pred, color) in zip(axes, splits):
-        r2  = r2_score(y_true, y_pred)
-        mae = mean_absolute_error(y_true, y_pred)
-        ax.scatter(y_true, y_pred, alpha=0.55, color=color,
-                   edgecolors='k', linewidths=0.3, s=30)
-        ax.plot([y_min, y_max], [y_min, y_max], 'r--', linewidth=1.2, label='Perfect fit')
-        ax.set_xlim(y_min, y_max)
-        ax.set_ylim(y_min, y_max)
-        ax.set_xlabel('Actual yield (bu/acre)', fontsize=11)
-        ax.set_ylabel('Predicted yield (bu/acre)', fontsize=11)
-        ax.set_title(f'{label}\nR²={r2:.3f}  MAE={mae:.1f} bu/acre', fontsize=11)
-        ax.legend(fontsize=8)
-        ax.set_aspect('equal')
-
-    plt.suptitle(
-        f'XGBoost — {GRID_SIZE}×{GRID_SIZE} patch grid — Plot-level split\n'
-        f'Test R²={r2_score(y_test, y_pred_test):.3f}  '
-        f'MAE={mean_absolute_error(y_test, y_pred_test):.1f} bu/acre  '
-        f'Overfit gap={gap:.3f}',
-        fontsize=12
-    )
-    plt.tight_layout()
-    plt.savefig('predicted_vs_actual.png', dpi=150)
-    plt.show()
-    print("\nSaved predicted_vs_actual.png")
-
-    # ── Feature importances ──
+    # ── Feature importances — top 20 ──
     importance_df = pd.DataFrame({
         'feature':    feature_cols_filtered,
         'importance': model.feature_importances_
     }).sort_values('importance', ascending=False).head(20)
 
+    print("\n  === Top 20 Most Important Features ===")
+    print(importance_df.to_string(index=False))
+
+    # ── Save model ──
+    joblib.dump({'model': model, 'imputer': imputer, 'selector': selector,
+                 'feature_cols': feature_cols_filtered},
+                'best_model.pkl')
+    print("\nModel saved → best_model.pkl")
+
+    # ── Plot 1: Predicted vs Actual (3 panels) ──
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    for ax, (label, y_true, y_pred, color) in zip(axes, [
+        ('Train',      y_train, y_pred_train, 'steelblue'),
+        ('Validation', y_val,   y_pred_val,   'darkorange'),
+        ('Test',       y_test,  y_pred_test,  'green'),
+    ]):
+        r2  = r2_score(y_true, y_pred)
+        mae = mean_absolute_error(y_true, y_pred)
+        ax.scatter(y_true, y_pred, alpha=0.6, color=color, edgecolors='k', linewidths=0.4)
+        mn, mx = np.concatenate([y_train, y_val, y_test]).min(), np.concatenate([y_train, y_val, y_test]).max()
+        ax.plot([mn, mx], [mn, mx], 'r--', label='Perfect fit')
+        ax.set_xlabel('Actual Yield (bu/acre)')
+        ax.set_ylabel('Predicted Yield (bu/acre)')
+        ax.set_title(f'{label}\nR²={r2:.3f}  MAE={mae:.1f} bu/acre')
+        ax.legend(fontsize=8)
+    plt.suptitle(f'XGBoost — Patch grid {GRID_SIZE}×{GRID_SIZE} — Predicted vs Actual', fontsize=13)
+    plt.tight_layout()
+    plt.savefig('predicted_vs_actual.png', dpi=150)
+    plt.show()
+    print("Saved predicted_vs_actual.png")
+
+    # ── Plot 2: Feature importances ──
     fig, ax = plt.subplots(figsize=(9, 7))
-    ax.barh(importance_df['feature'][::-1], importance_df['importance'][::-1],
-            color='steelblue', alpha=0.8)
+    ax.barh(importance_df['feature'][::-1], importance_df['importance'][::-1], color='steelblue')
     ax.set_xlabel('Importance')
-    ax.set_title('Top 20 feature importances (XGBoost)')
+    ax.set_title(f'Top 20 Feature Importances (XGBoost)')
     plt.tight_layout()
     plt.savefig('feature_importances.png', dpi=150)
     plt.show()
     print("Saved feature_importances.png")
 
-    print("\n  === Top 10 Features ===")
-    print(importance_df.head(10).to_string(index=False))
-
-    # Export everything needed for inference
-    joblib.dump({
-        'model': model, 
-        'imputer': imputer, 
-        'selector': selector,
-        'feature_cols': feature_cols_filtered
-    }, 'best_model.pkl')
-    
-    # Save the priors for the automated pipeline!
-    train_geno_mean_dict.to_csv('historical_genotype_yields.csv')
-    print("Saved 'historical_genotype_yields.csv' for inference priors.")
-
-    # ── Save full predictions with metadata for the scoring engine ──
+    # ── Save predictions with metadata (all splits) ──
     METADATA_COLS = ['location', 'range', 'row', 'experiment',
                      'genotype', 'nitrogenTreatment', 'timepoint']
-    # Only keep metadata cols that exist in the dataframe
     meta_cols_present = [c for c in METADATA_COLS if c in train_df.columns]
 
     def build_predictions_df(df, y_true, y_pred, split_name):
@@ -599,9 +600,7 @@ def run_random_forest(features_df, groundtruth_df,
         out['error']           = y_pred - y_true
         out['absolute_error']  = np.abs(y_pred - y_true)
         out['pct_error']       = np.where(
-            y_true != 0,
-            np.abs((y_true - y_pred) / y_true) * 100,
-            np.nan
+            y_true != 0, np.abs((y_true - y_pred) / y_true) * 100, np.nan
         )
         out['split'] = split_name
         return out
@@ -616,6 +615,10 @@ def run_random_forest(features_df, groundtruth_df,
     print(f"Saved xgb_predictions_full.csv")
     print(f"  Columns: {all_preds.columns.tolist()}")
     print(f"  Rows: {len(all_preds)} ({all_preds['split'].value_counts().to_dict()})")
+
+    # Save the genotype priors for inference pipeline
+    train_geno_mean.to_csv('historical_genotype_yields.csv')
+    print("Saved historical_genotype_yields.csv (train-only genotype priors)")
 
     return model
 

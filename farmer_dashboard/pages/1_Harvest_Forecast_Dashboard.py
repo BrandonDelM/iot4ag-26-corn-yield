@@ -5,6 +5,8 @@ and the heavy sensor data tucked safely behind an expander.
 """
 import streamlit as st
 import plotly.express as px
+import pandas as pd
+import os
 import sys
 from pathlib import Path
 
@@ -22,8 +24,21 @@ inject_custom_css()
 n_rate    = st.session_state.get("n_rate", 150)
 genotype  = st.session_state.get("genotype", "DKC62-08")
 plant_dt  = st.session_state.get("plant_date", None)
+use_real  = st.session_state.get("real_data", False)
 
-predicted  = calculate_mock_yield(n_rate, genotype)
+# ── Check for real inference results ──────────────────────────────
+repo_root = Path(__file__).resolve().parent.parent.parent
+scoring_dir = repo_root / "scoring_outputs"
+rankings_path = scoring_dir / "hybrid_rankings.csv"
+
+real_rankings = None
+if use_real and rankings_path.exists():
+    real_rankings = pd.read_csv(rankings_path)
+    predicted = real_rankings["predicted_yield_mean"].mean()
+    logger.info(f"Using REAL inference data. Mean predicted yield: {predicted:.1f}")
+else:
+    predicted = calculate_mock_yield(n_rate, genotype)
+
 field_ac   = 500
 corn_price = 4.40
 revenue    = predicted * field_ac * corn_price
@@ -35,6 +50,9 @@ st.caption("The three numbers that matter to your bottom line — updated from t
 
 if not st.session_state.get("setup_done"):
     st.warning("Go to the **Field Digital Twin Setup** page first to enter your field details. Showing defaults below.")
+
+if use_real and real_rankings is not None:
+    st.success("Showing results from **real XGBoost inference** on your uploaded data.")
 
 # ── KPI Cards ─────────────────────────────────────────────────────
 c1, c2, c3 = st.columns(3)
@@ -82,8 +100,24 @@ st.plotly_chart(fig, use_container_width=True)
 # ── Deep-dive expander ────────────────────────────────────────────
 with st.expander("View Comprehensive Sensor Data (for technical review)", expanded=False):
     logger.debug("Deep-dive spectral table accessed.")
-    st.caption(
-        "Raw per-plot spectral indices and soil moisture readings extracted "
-        "from 6-band Pléiades Neo imagery.  This data feeds the ML model."
-    )
-    st.dataframe(generate_mock_spectral_data(), use_container_width=True, hide_index=True)
+
+    # Show real prediction data if available, else show mock spectral data
+    predictions_path = repo_root / "xgb_predictions_full.csv"
+    if use_real and predictions_path.exists():
+        st.caption("Real per-plot predictions from the XGBoost inference pipeline.")
+        real_preds = pd.read_csv(predictions_path)
+        display_cols = [c for c in real_preds.columns if c in [
+            "genotype", "location", "timepoint", "experiment", "range", "row",
+            "predicted_yield", "actual_yield", "yieldPerAcre"
+        ]]
+        if display_cols:
+            st.dataframe(real_preds[display_cols].head(100), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(real_preds.head(100), use_container_width=True, hide_index=True)
+    else:
+        st.caption(
+            "Raw per-plot spectral indices and soil moisture readings extracted "
+            "from 6-band Pléiades Neo imagery.  This data feeds the ML model."
+        )
+        st.dataframe(generate_mock_spectral_data(), use_container_width=True, hide_index=True)
+
