@@ -35,6 +35,46 @@ top_n = st.sidebar.slider("Top N Hybrids to Display", 5, len(rankings), 10)
 filtered_rankings = rankings.head(top_n)
 
 # ─────────────────────────────────────────────
+# SIDEBAR: DATA UPLOAD & INFERENCE
+# ─────────────────────────────────────────────
+st.sidebar.header("🚁 Upload New Flight")
+st.sidebar.markdown("Upload a ZIP of plot images and your planting CSV to generate new predictions.")
+
+uploaded_zip = st.sidebar.file_uploader("1. Upload Drone Imagery (.zip)", type="zip")
+uploaded_csv = st.sidebar.file_uploader("2. Upload Planting Plan (.csv)", type="csv")
+
+if st.sidebar.button("Run AI Predictions", type="primary"):
+    if uploaded_zip is not None and uploaded_csv is not None:
+        
+        # 1. Save the uploaded memory buffers to temporary files on disk
+        temp_zip_path = "temp_upload.zip"
+        temp_csv_path = "temp_metadata.csv"
+        
+        with open(temp_zip_path, "wb") as f:
+            f.write(uploaded_zip.getbuffer())
+        with open(temp_csv_path, "wb") as f:
+            f.write(uploaded_csv.getbuffer())
+            
+        # 2. Trigger the inference pipeline with a loading spinner
+        with st.spinner("Extracting features and predicting yield... This may take a minute."):
+            import run_inference
+            # Ensure 'best_model.pkl' matches your actual saved model filename
+            run_inference.process_zip_upload(temp_zip_path, temp_csv_path, 'best_model.pkl')
+            
+        # 3. Clean up the temp files
+        os.remove(temp_zip_path)
+        os.remove(temp_csv_path)
+        
+        # 4. Force Streamlit to refresh the page and load the newly generated CSVs
+        st.success("Predictions complete! Refreshing dashboard...")
+        st.rerun()
+        
+    else:
+        st.sidebar.error("⚠️ Please upload both the ZIP and the CSV files first.")
+
+st.sidebar.divider() # Adds a clean visual line before your other filters
+
+# ─────────────────────────────────────────────
 # MAIN LAYOUT
 # ─────────────────────────────────────────────
 st.title("🌱 Seed Breeder Assessment Dashboard")
@@ -46,7 +86,7 @@ display_df = filtered_rankings[['genotype', 'predicted_yield_mean', 'predicted_y
 
 st.dataframe(
     display_df.set_index('genotype'),
-    use_container_width=True,
+    width='stretch',
     column_config={
         "predicted_yield_mean": st.column_config.NumberColumn("Mean Yield (bu/ac)", format="%.1f 🌽"),
         "predicted_yield_std": st.column_config.ProgressColumn("Stability (Std Dev)", min_value=0, max_value=float(rankings['predicted_yield_std'].max())),
@@ -72,7 +112,7 @@ with col1:
     )
     # Push the text labels above the dots so they don't overlap
     fig_scatter.update_traces(textposition='top center', marker=dict(size=12, line=dict(width=1, color='DarkSlateGrey')))
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig_scatter, width='stretch')
 
 # --- SECTION 3: Time Series ---
 with col2:
@@ -96,7 +136,7 @@ with col2:
         markers=True,
         labels={'predicted_yield': 'Predicted Yield', 'timepoint': 'Timepoint'}
     )
-    st.plotly_chart(fig_ts, use_container_width=True)
+    st.plotly_chart(fig_ts, width='stretch')
 
 # --- SECTION 4: GxE Heatmap ---
 st.subheader("4. GxE Interaction Matrix")
@@ -114,4 +154,4 @@ fig_heat = px.imshow(
     color_continuous_scale='Viridis',
     aspect="auto"
 )
-st.plotly_chart(fig_heat, use_container_width=True)
+st.plotly_chart(fig_heat, width='stretch')
