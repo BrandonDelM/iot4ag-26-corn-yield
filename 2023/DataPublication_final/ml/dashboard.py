@@ -43,7 +43,7 @@ if st.sidebar.button("Run Predictions"):
             
         with st.spinner("Processing imagery and predicting yield..."):
             # Uses your specialized 2022 pre-trained model
-            run_inference.process_zip_upload(temp_zip_path, temp_csv_path, 'best_model.pkl')
+            run_inference.process_zip_upload(temp_zip_path, temp_csv_path, 'best_model_2022_UAV.pkl')
             st.sidebar.success("Analysis Complete!")
             st.cache_data.clear() # Forces the dashboard to reload the new CSVs
             st.rerun()
