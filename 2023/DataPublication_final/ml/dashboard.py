@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import os
+import run_inference
 
 st.set_page_config(page_title="Seed Breeder Assessment Tool", layout="wide")
 
@@ -15,24 +16,58 @@ def load_data():
         gxe = pd.read_csv(f'{output_dir}/gxe_matrix.csv')
         tp_rankings = pd.read_csv(f'{output_dir}/timepoint_rankings.csv')
     except FileNotFoundError:
-        st.error(f"⚠️ Could not find CSVs in {output_dir}/. Run scoring_engine.py first to generate them.")
-        st.stop()
+        # Provide empty dataframes so the UI doesn't crash on first load
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         
     return rankings, gxe, tp_rankings
 
 rankings, gxe_matrix, tp_rankings = load_data()
 
 # ─────────────────────────────────────────────
-# SIDEBAR FILTERS
+# SIDEBAR FILTERS & INFERENCE
 # ─────────────────────────────────────────────
-st.sidebar.header("Filter Pipeline")
+st.sidebar.header("1. Upload New Data")
+uploaded_zip = st.sidebar.file_uploader("Upload Drone ZIP", type="zip")
+uploaded_csv = st.sidebar.file_uploader("Upload Planting CSV", type="csv")
 
-# Dynamically grab the locations/environments from the GxE matrix columns
-environments = [c for c in gxe_matrix.columns if c != 'genotype']
-selected_envs = st.sidebar.multiselect("Select Environments", environments, default=environments)
+if st.sidebar.button("🚀 Run AI Predictions"):
+    if uploaded_zip and uploaded_csv:
+        # Save temporary files for the pipeline to read
+        temp_zip_path = "temp_upload.zip"
+        temp_csv_path = "temp_metadata.csv"
+        
+        with open(temp_zip_path, "wb") as f:
+            f.write(uploaded_zip.getbuffer())
+        with open(temp_csv_path, "wb") as f:
+            f.write(uploaded_csv.getbuffer())
+            
+        with st.spinner("Processing imagery and predicting yield..."):
+            # Uses your specialized 2022 pre-trained model
+            run_inference.process_zip_upload(temp_zip_path, temp_csv_path, 'best_model_2022_UAV.pkl')
+            st.sidebar.success("Analysis Complete!")
+            st.cache_data.clear() # Forces the dashboard to reload the new CSVs
+            st.rerun()
+    else:
+        st.sidebar.error("Please upload both files first.")
 
-top_n = st.sidebar.slider("Top N Hybrids to Display", 5, len(rankings), 10)
-filtered_rankings = rankings.head(top_n)
+st.sidebar.divider()
+st.sidebar.header("2. Dashboard Filters")
+
+if not gxe_matrix.empty:
+    # 1. Drop any 'Unnamed' columns that shouldn't be there
+    clean_cols = [c for c in gxe_matrix.columns if not c.startswith('Unnamed')]
+    
+    # 2. Grab only the columns that represent actual locations
+    # (Exclude 'genotype' and any metadata)
+    environments = [c for c in clean_cols if c not in ['genotype', 'breeder_score', 'yield_tier']]
+    
+    selected_envs = st.sidebar.multiselect("Select Environments", environments, default=environments)
+    
+    if not rankings.empty:
+        top_n = st.sidebar.slider("Top Hybrids to Display", 5, len(rankings), 10)
+        filtered_rankings = rankings.head(top_n)
+else:
+    st.sidebar.info("Run predictions to enable filters.")
 
 # ─────────────────────────────────────────────
 # MAIN LAYOUT
@@ -40,16 +75,30 @@ filtered_rankings = rankings.head(top_n)
 st.title("🌱 Seed Breeder Assessment Dashboard")
 st.markdown("Identify stable, high-yielding commercial candidates and cull underperformers early.")
 
+if rankings.empty:
+    st.warning("📊 No prediction data found. Upload drone imagery and a planting plan in the sidebar to begin.")
+    st.stop()
+
 # --- SECTION 1: The Ranker (Leaderboard) ---
 st.subheader("1. Hybrid Ranker (Top Candidates)")
-display_df = filtered_rankings[['genotype', 'predicted_yield_mean', 'predicted_yield_std', 'breeder_score', 'yield_tier', 'stability_tier']].copy()
+
+# 1. Update display columns to use our new percentage
+target_cols = ['genotype', 'predicted_yield_mean', 'stability_pct', 'breeder_score', 'yield_tier', 'stability_tier']
+available_cols = [c for c in target_cols if c in filtered_rankings.columns]
+display_df = filtered_rankings[available_cols].copy()
 
 st.dataframe(
     display_df.set_index('genotype'),
-    use_container_width=True,
+    width='stretch', 
     column_config={
         "predicted_yield_mean": st.column_config.NumberColumn("Mean Yield (bu/ac)", format="%.1f 🌽"),
-        "predicted_yield_std": st.column_config.ProgressColumn("Stability (Std Dev)", min_value=0, max_value=float(rankings['predicted_yield_std'].max())),
+        "stability_pct": st.column_config.ProgressColumn(
+            "Stability Index", 
+            help="100% means perfectly consistent performance across all drone flights.",
+            format="%.0f%%", # This turns 0.85 into 85%
+            min_value=0, 
+            max_value=1
+        ),
         "breeder_score": st.column_config.NumberColumn("Breeder Score", format="%.3f")
     }
 )
@@ -59,59 +108,45 @@ col1, col2 = st.columns(2)
 # --- SECTION 2: Yield vs. Stability Scatter ---
 with col1:
     st.subheader("2. Performance vs. Stability")
-    st.markdown("Ideal hybrids sit in the **bottom right** (High Yield, Low Variance).")
-    
     fig_scatter = px.scatter(
-        filtered_rankings, 
-        x='predicted_yield_mean', 
-        y='predicted_yield_std', 
+        filtered_rankings,
+        x='predicted_yield_mean',
+        y='predicted_yield_std',
         text='genotype',
-        labels={'predicted_yield_mean': 'Mean Predicted Yield', 'predicted_yield_std': 'Yield Variance (Instability)'},
         color='predicted_yield_std',
-        color_continuous_scale='RdYlGn_r'
+        color_continuous_scale='RdYlGn_r',
+        labels={'predicted_yield_mean': 'Predicted Mean Yield', 'predicted_yield_std': 'Yield Variance (Instability)'}
     )
-    # Push the text labels above the dots so they don't overlap
-    fig_scatter.update_traces(textposition='top center', marker=dict(size=12, line=dict(width=1, color='DarkSlateGrey')))
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig_scatter, width='stretch')
 
-# --- SECTION 3: Time Series ---
+# --- SECTION 3: Mid-Season Growth Trajectory ---
 with col2:
-    st.subheader("3. Mid-Season Growth Trajectory")
-    st.markdown("Tracking predicted yield stability over timepoints.")
-    
-    # Melt the wide timepoint pivot table into a long format for Plotly
-    ts_long = tp_rankings[tp_rankings['genotype'].isin(filtered_rankings['genotype'])].melt(
-        id_vars='genotype', 
-        var_name='timepoint', 
-        value_name='predicted_yield'
-    )
-    # Clean up the X-axis labels (e.g., changes "predicted_yield_TP1" -> "TP1")
-    ts_long['timepoint'] = ts_long['timepoint'].str.replace('predicted_yield_', '')
-    
-    fig_ts = px.line(
-        ts_long, 
-        x='timepoint', 
-        y='predicted_yield', 
-        color='genotype', 
-        markers=True,
-        labels={'predicted_yield': 'Predicted Yield', 'timepoint': 'Timepoint'}
-    )
-    st.plotly_chart(fig_ts, use_container_width=True)
+    st.subheader("3. Growth Trajectory")
+    if 'genotype' in tp_rankings.columns:
+        ts_long = tp_rankings[tp_rankings['genotype'].isin(filtered_rankings['genotype'])].melt(
+            id_vars='genotype', 
+            var_name='timepoint', 
+            value_name='predicted_yield'
+        )
+        ts_long['timepoint'] = ts_long['timepoint'].str.replace('predicted_yield_', '')
+        
+        fig_ts = px.line(
+            ts_long, x='timepoint', y='predicted_yield', color='genotype', markers=True
+        )
+        st.plotly_chart(fig_ts, width='stretch')
+    else:
+        st.info("Timepoint data will appear here once genotype labels are processed.")
 
 # --- SECTION 4: GxE Heatmap ---
 st.subheader("4. GxE Interaction Matrix")
-st.markdown("Visualizing which hybrids are robust across all environments vs. highly specialized.")
-
-# Filter the matrix for the top N genotypes and the sidebar-selected environments
 gxe_filtered = gxe_matrix[gxe_matrix['genotype'].isin(filtered_rankings['genotype'])].set_index('genotype')
-gxe_filtered = gxe_filtered[selected_envs]
 
-fig_heat = px.imshow(
-    gxe_filtered, 
-    labels=dict(x="Environment", y="Genotype", color="Predicted Yield"),
-    x=gxe_filtered.columns,
-    y=gxe_filtered.index,
-    color_continuous_scale='Viridis',
-    aspect="auto"
-)
-st.plotly_chart(fig_heat, use_container_width=True)
+if not gxe_filtered.empty and selected_envs:
+    gxe_display = gxe_filtered[selected_envs]
+    fig_heat = px.imshow(
+        gxe_display, 
+        aspect="auto", 
+        color_continuous_scale='YlGn',
+        labels=dict(x="Environment", y="Genotype", color="Yield")
+    )
+    st.plotly_chart(fig_heat, width='stretch')

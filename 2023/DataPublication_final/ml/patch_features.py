@@ -188,8 +188,13 @@ def collect_all_satellite(image_root='../Satellite', grid_size=4):
 
 
 def collect_all_rgb(image_root='../UAV', grid_size=4):
-    all_rgb = glob.glob(os.path.join(image_root, '**', '*.jpg'), recursive=True)
-    all_rgb += glob.glob(os.path.join(image_root, '**', '*.png'), recursive=True)
+    # REMOVED .tif and .tiff from this list so it stops crashing!
+    valid_extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
+    
+    all_rgb = []
+    import glob
+    for ext in valid_extensions:
+        all_rgb.extend(glob.glob(os.path.join(image_root, '**', ext), recursive=True))
 
     if not all_rgb:
         print(f"No RGB files found under {image_root}")
