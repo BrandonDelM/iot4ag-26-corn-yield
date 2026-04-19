@@ -30,7 +30,7 @@ st.sidebar.header("1. Upload New Data")
 uploaded_zip = st.sidebar.file_uploader("Upload Drone ZIP", type="zip")
 uploaded_csv = st.sidebar.file_uploader("Upload Planting CSV", type="csv")
 
-if st.sidebar.button("🚀 Run AI Predictions"):
+if st.sidebar.button("Run Predictions"):
     if uploaded_zip and uploaded_csv:
         # Save temporary files for the pipeline to read
         temp_zip_path = "temp_upload.zip"
@@ -43,7 +43,7 @@ if st.sidebar.button("🚀 Run AI Predictions"):
             
         with st.spinner("Processing imagery and predicting yield..."):
             # Uses your specialized 2022 pre-trained model
-            run_inference.process_zip_upload(temp_zip_path, temp_csv_path, 'best_model_2022_UAV.pkl')
+            run_inference.process_zip_upload(temp_zip_path, temp_csv_path, 'best_model.pkl')
             st.sidebar.success("Analysis Complete!")
             st.cache_data.clear() # Forces the dashboard to reload the new CSVs
             st.rerun()
@@ -51,7 +51,7 @@ if st.sidebar.button("🚀 Run AI Predictions"):
         st.sidebar.error("Please upload both files first.")
 
 st.sidebar.divider()
-st.sidebar.header("2. Dashboard Filters")
+st.sidebar.header("Dashboard Filters")
 
 if not gxe_matrix.empty:
     # 1. Drop any 'Unnamed' columns that shouldn't be there
@@ -72,15 +72,14 @@ else:
 # ─────────────────────────────────────────────
 # MAIN LAYOUT
 # ─────────────────────────────────────────────
-st.title("🌱 Seed Breeder Assessment Dashboard")
-st.markdown("Identify stable, high-yielding commercial candidates and cull underperformers early.")
+st.title("Seed Breeder Assessment Dashboard")
 
 if rankings.empty:
-    st.warning("📊 No prediction data found. Upload drone imagery and a planting plan in the sidebar to begin.")
+    st.warning("No prediction data found. Upload drone imagery and a planting plan in the sidebar to begin.")
     st.stop()
 
 # --- SECTION 1: The Ranker (Leaderboard) ---
-st.subheader("1. Hybrid Ranker (Top Candidates)")
+st.subheader("Hybrid Ranker")
 
 # 1. Update display columns to use our new percentage
 target_cols = ['genotype', 'predicted_yield_mean', 'stability_pct', 'breeder_score', 'yield_tier', 'stability_tier']
@@ -91,7 +90,7 @@ st.dataframe(
     display_df.set_index('genotype'),
     width='stretch', 
     column_config={
-        "predicted_yield_mean": st.column_config.NumberColumn("Mean Yield (bu/ac)", format="%.1f 🌽"),
+        "predicted_yield_mean": st.column_config.NumberColumn("Mean Yield (bu/ac)", format="%.1f"),
         "stability_pct": st.column_config.ProgressColumn(
             "Stability Index", 
             help="100% means perfectly consistent performance across all drone flights.",
@@ -103,42 +102,64 @@ st.dataframe(
     }
 )
 
-col1, col2 = st.columns(2)
-
 # --- SECTION 2: Yield vs. Stability Scatter ---
-with col1:
-    st.subheader("2. Performance vs. Stability")
-    fig_scatter = px.scatter(
-        filtered_rankings,
-        x='predicted_yield_mean',
-        y='predicted_yield_std',
-        text='genotype',
-        color='predicted_yield_std',
-        color_continuous_scale='RdYlGn_r',
-        labels={'predicted_yield_mean': 'Predicted Mean Yield', 'predicted_yield_std': 'Yield Variance (Instability)'}
-    )
-    st.plotly_chart(fig_scatter, width='stretch')
+st.subheader("Performance vs. Stability")
+
+fig_scatter = px.scatter(
+    filtered_rankings,
+    x='predicted_yield_mean',
+    y='predicted_yield_std',
+    text='genotype',
+    color='predicted_yield_std',
+    color_continuous_scale='RdYlGn_r',
+    labels={'predicted_yield_mean': 'Mean Predicted Yield', 'predicted_yield_std': 'Yield Variance (Instability)'}
+)
+
+# Use width='stretch' to ensure it takes up the full row
+st.plotly_chart(fig_scatter, width='stretch')
+
 
 # --- SECTION 3: Mid-Season Growth Trajectory ---
-with col2:
-    st.subheader("3. Growth Trajectory")
-    if 'genotype' in tp_rankings.columns:
-        ts_long = tp_rankings[tp_rankings['genotype'].isin(filtered_rankings['genotype'])].melt(
-            id_vars='genotype', 
-            var_name='timepoint', 
-            value_name='predicted_yield'
-        )
-        ts_long['timepoint'] = ts_long['timepoint'].str.replace('predicted_yield_', '')
-        
-        fig_ts = px.line(
-            ts_long, x='timepoint', y='predicted_yield', color='genotype', markers=True
-        )
-        st.plotly_chart(fig_ts, width='stretch')
-    else:
-        st.info("Timepoint data will appear here once genotype labels are processed.")
+st.subheader("Growth Trajectory")
+
+if 'genotype' in tp_rankings.columns and not filtered_rankings.empty:
+    # 1. Melt the wide timepoint data
+    ts_long = tp_rankings[tp_rankings['genotype'].isin(filtered_rankings['genotype'])].melt(
+        id_vars='genotype', 
+        var_name='timepoint', 
+        value_name='predicted_yield'
+    )
+    ts_long['timepoint'] = ts_long['timepoint'].str.replace('predicted_yield_', '')
+
+    # 2. Rank-Based Color Map Logic
+    num_hybrids = len(filtered_rankings)
+    colors = px.colors.sample_colorscale(
+        "RdYlGn_r", 
+        [i/(num_hybrids - 1) if num_hybrids > 1 else 0 for i in range(num_hybrids)]
+    )
+    
+    color_map = {
+        row['genotype']: colors[i] 
+        for i, row in enumerate(filtered_rankings.to_dict('records'))
+    }
+
+    # 3. Plot using the full width
+    fig_ts = px.line(
+        ts_long, 
+        x='timepoint', 
+        y='predicted_yield', 
+        color='genotype',
+        color_discrete_map=color_map,
+        markers=True,
+        labels={'predicted_yield': 'Predicted Yield', 'timepoint': 'Timepoint'}
+    )
+    
+    st.plotly_chart(fig_ts, width='stretch')
+else:
+    st.info("Timepoint data will appear here once genotypes are processed.")
 
 # --- SECTION 4: GxE Heatmap ---
-st.subheader("4. GxE Interaction Matrix")
+st.subheader("GxE Interaction Matrix")
 gxe_filtered = gxe_matrix[gxe_matrix['genotype'].isin(filtered_rankings['genotype'])].set_index('genotype')
 
 if not gxe_filtered.empty and selected_envs:
