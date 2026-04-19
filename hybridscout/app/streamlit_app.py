@@ -51,32 +51,54 @@ st.caption("💡 **Mean Yield:** The average predicted harvest across all tested
 
 if not rankings.empty:
     df_ranker = rankings.copy()
-    
-    # Format and rename columns to match the requested layout
-    df_ranker = df_ranker.rename(columns={
-        "predicted_yield_mean": "Mean Yield (bu/ac)",
-        "breeder_score": "Breeder Score",
-        "yield_tier": "yield tier",
-        "stability_tier": "stability tier",
-    })
-    
-    # Create stability index string from std
+    df_ranker = df_ranker.sort_values(by="breeder_score", ascending=False).head(top_hybrids_n).reset_index(drop=True)
+
+    # Compute stability percentage (higher = more stable)
     if "predicted_yield_std" in df_ranker.columns:
-        df_ranker["Stability Index"] = (df_ranker["predicted_yield_std"] / df_ranker["Mean Yield (bu/ac)"] * 100).round(1).astype(str) + "%"
+        max_std = df_ranker["predicted_yield_std"].max()
+        if max_std > 0:
+            df_ranker["stability_pct"] = 1.0 - (df_ranker["predicted_yield_std"] / max_std)
+        else:
+            df_ranker["stability_pct"] = 1.0
     else:
-        df_ranker["Stability Index"] = "N/A"
-        
-    cols_to_show = ["genotype", "Mean Yield (bu/ac)", "Stability Index", "Breeder Score", "yield tier", "stability tier"]
-    df_ranker = df_ranker[cols_to_show]
-    
-    # Sort and slice
-    df_ranker = df_ranker.sort_values(by="Breeder Score", ascending=False).reset_index(drop=True).head(top_hybrids_n)
-    
-    # Format floats
-    df_ranker["Mean Yield (bu/ac)"] = df_ranker["Mean Yield (bu/ac)"].round(1)
-    df_ranker["Breeder Score"] = df_ranker["Breeder Score"].round(3)
-    
-    st.dataframe(df_ranker, use_container_width=True, hide_index=True)
+        df_ranker["stability_pct"] = 0.0
+
+    st.dataframe(
+        df_ranker.set_index("genotype"),
+        use_container_width=True,
+        column_config={
+            "predicted_yield_mean": st.column_config.NumberColumn("Mean Yield (bu/ac)", format="%.1f"),
+            "stability_pct": st.column_config.ProgressColumn(
+                "Stability Index",
+                help="100% = perfectly consistent across all environments.",
+                format="%.0f%%",
+                min_value=0,
+                max_value=1,
+            ),
+            "breeder_score": st.column_config.NumberColumn("Breeder Score", format="%.3f"),
+            "predicted_yield_std": st.column_config.NumberColumn("Yield Std Dev", format="%.2f"),
+            "yield_tier": "Yield Tier",
+            "stability_tier": "Stability Tier",
+        },
+    )
+
+    # Yield vs. Stability Scatter
+    if "predicted_yield_std" in df_ranker.columns:
+        st.markdown("---")
+        st.subheader("Performance vs. Stability")
+        st.caption("Ideal hybrids sit in the lower-right quadrant: high yield with low variance.")
+        fig_scatter = px.scatter(
+            df_ranker,
+            x="predicted_yield_mean",
+            y="predicted_yield_std",
+            text="genotype",
+            color="predicted_yield_std",
+            color_continuous_scale="RdYlGn_r",
+            labels={"predicted_yield_mean": "Mean Predicted Yield (bu/ac)", "predicted_yield_std": "Yield Variance"},
+        )
+        fig_scatter.update_traces(textposition="top center", marker=dict(size=12))
+        fig_scatter.update_layout(height=400, margin=dict(t=20, b=0))
+        st.plotly_chart(fig_scatter, use_container_width=True)
 else:
     st.warning("No ranking data found. Please run the backend ML pipeline.")
     df_ranker = pd.DataFrame()

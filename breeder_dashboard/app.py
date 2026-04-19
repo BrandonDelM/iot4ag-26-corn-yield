@@ -42,24 +42,65 @@ fake_genotypes = [
 # Clamp to available genotypes so arrays always match
 n_display = min(top_hybrids_n, len(fake_genotypes))
 
+yield_vals = np.round(np.random.uniform(47.0, 49.6, n_display), 1)
+std_vals = np.round(np.random.uniform(0.3, 2.5, n_display), 2)
+max_std = max(std_vals)
+stability_pct = np.round(1.0 - (std_vals / max_std), 3)
+
 rank_data = {
     "genotype": fake_genotypes[:n_display],
-    "Mean Yield (bu/ac)": np.round(np.random.uniform(47.0, 49.6, n_display), 1),
-    "Stability Index": [f"{np.random.randint(1, 5)}%" for _ in range(n_display)],
-    "Breeder Score": np.round(np.random.uniform(25.000, 31.980, n_display), 3),
-    "yield tier": [f"Tier {np.random.randint(1, 4)}" for _ in range(n_display)],
-    "stability tier": ["Elite" if i < 3 else f"Tier {np.random.randint(1, 4)}" for i in range(n_display)]
+    "predicted_yield_mean": yield_vals,
+    "predicted_yield_std": std_vals,
+    "stability_pct": stability_pct,
+    "breeder_score": np.round(yield_vals * stability_pct, 3),
+    "yield_tier": [f"Tier {np.random.randint(1, 4)}" for _ in range(n_display)],
+    "stability_tier": ["Elite" if i < 3 else f"Tier {np.random.randint(1, 4)}" for i in range(n_display)]
 }
 
 df_ranker = pd.DataFrame(rank_data)
-# Sort to make it look like a leaderboard
-df_ranker = df_ranker.sort_values(by="Breeder Score", ascending=False).reset_index(drop=True)
+df_ranker = df_ranker.sort_values(by="breeder_score", ascending=False).reset_index(drop=True)
 
-st.dataframe(df_ranker, use_container_width=True, hide_index=True)
+st.dataframe(
+    df_ranker.set_index("genotype"),
+    use_container_width=True,
+    column_config={
+        "predicted_yield_mean": st.column_config.NumberColumn("Mean Yield (bu/ac)", format="%.1f"),
+        "stability_pct": st.column_config.ProgressColumn(
+            "Stability Index",
+            help="100% = perfectly consistent across all environments.",
+            format="%.0f%%",
+            min_value=0,
+            max_value=1,
+        ),
+        "breeder_score": st.column_config.NumberColumn("Breeder Score", format="%.3f"),
+        "predicted_yield_std": st.column_config.NumberColumn("Yield Std Dev", format="%.2f"),
+        "yield_tier": "Yield Tier",
+        "stability_tier": "Stability Tier",
+    },
+)
 
 st.markdown("---")
 
-# 4. Main Content - Bottom Section (Charts)
+# 4. Yield vs. Stability Scatter
+st.subheader("Performance vs. Stability")
+st.caption("Ideal hybrids sit in the lower-right quadrant: high yield with low variance.")
+
+fig_scatter = px.scatter(
+    df_ranker,
+    x="predicted_yield_mean",
+    y="predicted_yield_std",
+    text="genotype",
+    color="predicted_yield_std",
+    color_continuous_scale="RdYlGn_r",
+    labels={"predicted_yield_mean": "Mean Predicted Yield (bu/ac)", "predicted_yield_std": "Yield Variance (Instability)"},
+)
+fig_scatter.update_traces(textposition="top center", marker=dict(size=12))
+fig_scatter.update_layout(height=400, margin=dict(t=20, b=0))
+st.plotly_chart(fig_scatter, use_container_width=True)
+
+st.markdown("---")
+
+# 5. Bottom Section (Charts)
 col_left, col_right = st.columns(2)
 
 with col_left:
